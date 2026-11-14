@@ -50,6 +50,7 @@ async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<vo
 
   // 1. Verify HMAC on the RAW body before parsing or processing anything.
   const signature = req.headers[SIGNATURE_HEADER];
+  console.error(`DEBUG ${req.method} ${req.url} sig=${signature ? 'present' : 'absent'} len=${rawBody.length} body=${rawBody.toString('utf8').slice(0, 2000)}`);
   if (!verifySignature(SECRET as string, rawBody, Array.isArray(signature) ? signature[0] : signature)) {
     sendJson(res, 401, { error: "invalid signature" }, true);
     return;
@@ -60,15 +61,27 @@ async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<vo
   try {
     envelope = JSON.parse(rawBody.toString("utf8")) as Record<string, unknown>;
   } catch {
+    console.error("DEBUG reject: invalid JSON");
     sendJson(res, 400, { error: "invalid JSON" }, true);
     return;
   }
+  if (envelope.type === "agent-games.preflight.v1") {
+    sendJson(
+      res,
+      200,
+      { status: "ok", type: "agent-games.preflight.v1", agent_id: envelope.agent_id ?? null, nonce: envelope.nonce ?? null },
+      true,
+    );
+    return;
+  }
   if (envelope.type !== "agent-games.proof-gatekeeper.v1") {
+    console.error(`DEBUG reject: unsupported type ${String(envelope.type)}`);
     sendJson(res, 400, { error: "unsupported task type" }, true);
     return;
   }
   const inputError = validateInput(envelope.input);
   if (inputError) {
+    console.error(`DEBUG reject: input ${inputError}`);
     sendJson(res, 400, { error: inputError }, true);
     return;
   }
