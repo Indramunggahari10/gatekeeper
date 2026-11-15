@@ -20,31 +20,70 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 /**
- * Tolerant verification: the platform's exact signature encoding is
- * undocumented (dashboard-only), so accept every encoding that still
- * proves knowledge of the secret: hex (any case) or base64, with or
- * without a "sha256=" prefix, against the secret as configured or
- * whitespace-trimmed (paste artifacts). An unsigned or wrongly signed
- * request still fails — every accepted form is a valid HMAC-SHA256
- * over the exact raw body under the configured secret.
+ * Verification battery: the platform's exact signature construction is
+ * undocumented (dashboard-only), and the displayed secret is hex-looking,
+ * so the platform may key its HMAC with the secret string (UTF-8), the
+ * trimmed string, or the raw bytes the hex/base64 decodes to. Accept every
+ * form that still proves knowledge of the secret: hex (any case), base64,
+ * or base64url, with or without a "sha256=" prefix, over the exact raw
+ * body, under any of those key forms. An unsigned or wrongly signed
+ * request still fails — every accepted form is a valid HMAC-SHA256 over
+ * the exact raw body under a key derived only from the configured secret.
  */
+function toB64url(b64: string): string {
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** Candidate HMAC keys derived from the configured secret. Values never logged. */
+function keyCandidates(secret: string): Array<{ name: string; key: Buffer }> {
+  const out = new Map<string, { name: string; key: Buffer }>();
+  const add = (name: string, key: Buffer) => {
+    const id = key.toString("hex");
+    if (!out.has(id)) out.set(id, { name, key });
+  };
+  const trimmed = secret.trim();
+  add("utf8", Buffer.from(secret, "utf8"));
+  add("utf8-trimmed", Buffer.from(trimmed, "utf8"));
+  add("utf8-trimmed-lower", Buffer.from(trimmed.toLowerCase(), "utf8"));
+  add("utf8-trimmed-upper", Buffer.from(trimmed.toUpperCase(), "utf8"));
+  if (/^[0-9a-fA-F]+$/.test(trimmed) && trimmed.length % 2 === 0 && trimmed.length >= 2) {
+    add("hex-decoded", Buffer.from(trimmed, "hex"));
+  }
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed) && trimmed.length % 4 !== 1) {
+    const raw = Buffer.from(trimmed, "base64");
+    if (raw.length > 0 && raw.toString("base64").replace(/=+$/, "") === trimmed.replace(/=+$/, "")) {
+      add("base64-decoded", raw);
+    }
+  }
+  return [...out.values()];
+}
+
+export function verifySignatureDetailed(
+  secret: string,
+  rawBody: Buffer,
+  headerValue: string | undefined,
+): { ok: boolean; scheme: string } {
+  if (!headerValue) return { ok: false, scheme: "absent" };
+  let value = headerValue.trim();
+  if (/^sha256=/i.test(value)) value = value.slice(7);
+  const lower = value.toLowerCase();
+  for (const { name, key } of keyCandidates(secret)) {
+    const digest = createHmac("sha256", key).update(rawBody).digest();
+    const hex = digest.toString("hex");
+    if (safeEqual(lower, hex)) return { ok: true, scheme: `${name}/hex` };
+    const b64 = digest.toString("base64");
+    if (safeEqual(value, b64)) return { ok: true, scheme: `${name}/base64` };
+    if (safeEqual(value, toB64url(b64))) return { ok: true, scheme: `${name}/base64url` };
+  }
+  return { ok: false, scheme: "none" };
+}
+
 export function verifySignature(
   secret: string,
   rawBody: Buffer,
   headerValue: string | undefined,
 ): boolean {
-  if (!headerValue) return false;
-  let value = headerValue.trim();
-  if (/^sha256=/i.test(value)) value = value.slice(7);
-  const lower = value.toLowerCase();
-  const secrets = [...new Set([secret, secret.trim()])];
-  for (const candidate of secrets) {
-    const hex = createHmac("sha256", candidate).update(rawBody).digest("hex");
-    if (safeEqual(lower, hex)) return true;
-    const b64 = createHmac("sha256", candidate).update(rawBody).digest("base64");
-    if (safeEqual(value, b64)) return true;
-  }
-  return false;
+  return verifySignatureDetailed(secret, rawBody, headerValue).ok;
 }
 
 /** Shape-only description of a signature header value. NEVER the value. */
