@@ -30,14 +30,27 @@ export interface ProofResult {
 
 /**
  * Map an arbitrary task id string onto a BN128 field element.
- * HYPOTHESIS — the platform's mapping is undocumented and not derivable
- * from the wasm (circuit-probe README §5): bare-UUID hex -> integer;
- * 0x-hex -> BigInt mod p; anything else -> SHA-256 UTF-8 mod p.
- * Isolated here so it can be swapped in one place if practice/round
- * evidence points to a different mapping.
+ * Platform ids carry a namespace prefix plus a UUID ("task_R03_<uuid>",
+ * "practice_<uuid>"). The platform's docs specify NO hash for this
+ * mapping, so the natural field encoding is the UUID itself as a 128-bit
+ * integer — the UUID is the task's identity; the prefix is namespacing.
+ * EVIDENCE: R03 tasks answered with SHA-256(full string) showed 0
+ * verified proofs on the dashboard 80+ minutes later (2 answered, 0
+ * verified as of 20:42 WIB 15 Nov), while all decisions were correct —
+ * consistent with a taskId-encoding mismatch (or delayed batching, which
+ * cannot be ruled out). Bare 32-hex and 0x-hex forms keep their old
+ * behavior; anything without a UUID still falls back to SHA-256 mod p.
+ * Isolated here so it can be swapped in one place if round evidence
+ * points to a different mapping.
  */
 export function taskIdToField(taskId: string): string {
   const s = taskId.trim();
+  const uuidMatch = s.match(
+    /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/,
+  );
+  if (uuidMatch) {
+    return BigInt("0x" + uuidMatch[0].replace(/-/g, "")).toString();
+  }
   const uuid = s.replace(/-/g, "");
   if (/^[0-9a-fA-F]{32}$/.test(uuid)) return BigInt("0x" + uuid).toString();
   if (/^0x[0-9a-fA-F]+$/.test(s)) return (BigInt(s) % FIELD_PRIME).toString();

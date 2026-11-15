@@ -3,7 +3,7 @@ import { decide, validateInput, type GatekeeperInput } from "./decide.js";
 import { SIGNATURE_HEADER, describeSignature, signBody, signBodyWithKey, verifySignatureDetailed } from "./hmac.js";
 import { proveDecision } from "./prover.js";
 
-const BUILD = "official-circuit-1";
+const BUILD = "official-circuit-2";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET;
