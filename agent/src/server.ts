@@ -3,7 +3,7 @@ import { decide, validateInput, type GatekeeperInput } from "./decide.js";
 import { SIGNATURE_HEADER, describeSignature, signBody, signBodyWithKey, verifySignatureDetailed } from "./hmac.js";
 import { proveDecision, verifyProof } from "./prover.js";
 
-const BUILD = "hmac-adaptive-1";
+const BUILD = "preflight-shape-1";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET;
@@ -78,12 +78,9 @@ async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<vo
     return;
   }
   if (envelope.type === "agent-games.preflight.v1") {
-    sendJson(
-      res,
-      200,
-      { status: "ok", type: "agent-games.preflight.v1", agent_id: envelope.agent_id ?? null, nonce: envelope.nonce ?? null },
-      replyKey,
-    );
+    // Protocol-v1 preflight answer (exact shape the platform validates):
+    // { ok: true, protocolVersion: "v1" }, signed. No field echo.
+    sendJson(res, 200, { ok: true, protocolVersion: "v1" }, replyKey);
     return;
   }
   if (envelope.type !== "agent-games.proof-gatekeeper.v1") {
