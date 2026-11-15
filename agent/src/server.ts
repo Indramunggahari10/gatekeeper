@@ -1,7 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { decide, validateInput, type GatekeeperInput } from "./decide.js";
-import { SIGNATURE_HEADER, signBody, verifySignature } from "./hmac.js";
+import { SIGNATURE_HEADER, describeSignature, signBody, verifySignature } from "./hmac.js";
 import { proveDecision, verifyProof } from "./prover.js";
+
+const BUILD = "hmac-tolerant-1";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET;
@@ -53,8 +55,9 @@ async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<vo
 
   // 1. Verify HMAC on the RAW body before parsing or processing anything.
   const signature = req.headers[SIGNATURE_HEADER];
-  console.error(`DEBUG ${req.method} ${req.url} sig=${signature ? 'present' : 'absent'} len=${rawBody.length} body=${rawBody.toString('utf8').slice(0, 2000)}`);
-  if (!verifySignature(SECRET as string, rawBody, Array.isArray(signature) ? signature[0] : signature)) {
+  const sigValue = Array.isArray(signature) ? signature[0] : signature;
+  console.error(`DEBUG ${req.method} ${req.url} sig=${describeSignature(sigValue)} headers=${Object.keys(req.headers).join(",")} len=${rawBody.length} body=${rawBody.toString('utf8').slice(0, 2000)}`);
+  if (!verifySignature(SECRET as string, rawBody, sigValue)) {
     sendJson(res, 401, { error: "invalid signature" }, true);
     return;
   }
@@ -128,11 +131,11 @@ const server = createServer((req, res) => {
   (async () => {
     try {
       if (req.method === "GET" && req.url === "/health") {
-        sendJson(res, 200, { status: "ok", service: "agent-games-gatekeeper" }, false);
+        sendJson(res, 200, { status: "ok", service: "agent-games-gatekeeper", build: BUILD }, false);
         return;
       }
       if (req.method === "GET" && req.url === "/") {
-        sendJson(res, 200, { service: "agent-games-gatekeeper", taskPath: "POST /task" }, false);
+        sendJson(res, 200, { service: "agent-games-gatekeeper", taskPath: "POST /task", build: BUILD }, false);
         return;
       }
       if (req.method === "POST" && (req.url === "/task" || req.url === "/")) {
