@@ -58,24 +58,36 @@ function keyCandidates(secret: string): Array<{ name: string; key: Buffer }> {
   return [...out.values()];
 }
 
+/** Sign a response body with an explicit HMAC key (matched request key form). */
+export function signBodyWithKey(key: Buffer, rawBody: Buffer): string {
+  return createHmac("sha256", key).update(rawBody).digest("hex");
+}
+
+/**
+ * Returns the matched scheme AND the key that verified the request, so
+ * responses can be signed with the same key form the platform used.
+ * The platform verifies response signatures with the same secret
+ * derivation it signs requests with; mirroring the matched form keeps
+ * request verification and response signing consistent.
+ */
 export function verifySignatureDetailed(
   secret: string,
   rawBody: Buffer,
   headerValue: string | undefined,
-): { ok: boolean; scheme: string } {
-  if (!headerValue) return { ok: false, scheme: "absent" };
+): { ok: boolean; scheme: string; key: Buffer | null } {
+  if (!headerValue) return { ok: false, scheme: "absent", key: null };
   let value = headerValue.trim();
   if (/^sha256=/i.test(value)) value = value.slice(7);
   const lower = value.toLowerCase();
   for (const { name, key } of keyCandidates(secret)) {
     const digest = createHmac("sha256", key).update(rawBody).digest();
     const hex = digest.toString("hex");
-    if (safeEqual(lower, hex)) return { ok: true, scheme: `${name}/hex` };
+    if (safeEqual(lower, hex)) return { ok: true, scheme: `${name}/hex`, key };
     const b64 = digest.toString("base64");
-    if (safeEqual(value, b64)) return { ok: true, scheme: `${name}/base64` };
-    if (safeEqual(value, toB64url(b64))) return { ok: true, scheme: `${name}/base64url` };
+    if (safeEqual(value, b64)) return { ok: true, scheme: `${name}/base64`, key };
+    if (safeEqual(value, toB64url(b64))) return { ok: true, scheme: `${name}/base64url`, key };
   }
-  return { ok: false, scheme: "none" };
+  return { ok: false, scheme: "none", key: null };
 }
 
 export function verifySignature(

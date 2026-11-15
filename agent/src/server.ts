@@ -1,9 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { decide, validateInput, type GatekeeperInput } from "./decide.js";
-import { SIGNATURE_HEADER, describeSignature, signBody, verifySignatureDetailed } from "./hmac.js";
+import { SIGNATURE_HEADER, describeSignature, signBody, signBodyWithKey, verifySignatureDetailed } from "./hmac.js";
 import { proveDecision, verifyProof } from "./prover.js";
 
-const BUILD = "hmac-battery-1";
+const BUILD = "hmac-adaptive-1";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET;
@@ -42,10 +42,11 @@ function readRawBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
-function sendJson(res: ServerResponse, status: number, obj: unknown, sign: boolean): void {
+function sendJson(res: ServerResponse, status: number, obj: unknown, sign: boolean | Buffer): void {
   const body = Buffer.from(JSON.stringify(obj), "utf8");
   const headers: Record<string, string> = { "content-type": "application/json" };
-  if (sign) headers[SIGNATURE_HEADER] = signBody(SECRET as string, body);
+  if (sign === true) headers[SIGNATURE_HEADER] = signBody(SECRET as string, body);
+  else if (Buffer.isBuffer(sign)) headers[SIGNATURE_HEADER] = signBodyWithKey(sign, body);
   res.writeHead(status, headers);
   res.end(body);
 }
@@ -62,6 +63,10 @@ async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<vo
     sendJson(res, 401, { error: "invalid signature" }, true);
     return;
   }
+  // Sign success responses with the key form that verified the request:
+  // the platform verifies response signatures with the same secret
+  // derivation it signs requests with.
+  const replyKey: Buffer | true = check.key ?? true;
 
   // 2. Parse + validate the envelope.
   let envelope: Record<string, unknown>;
@@ -77,7 +82,7 @@ async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<vo
       res,
       200,
       { status: "ok", type: "agent-games.preflight.v1", agent_id: envelope.agent_id ?? null, nonce: envelope.nonce ?? null },
-      true,
+      replyKey,
     );
     return;
   }
@@ -125,7 +130,7 @@ async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<vo
   console.log(
     `task ${taskId} mode=${mode} decision=${result.decision} reason=${result.reason_code} proof=${"proof" in response}`,
   );
-  sendJson(res, 200, response, true);
+  sendJson(res, 200, response, replyKey);
 }
 
 const server = createServer((req, res) => {
