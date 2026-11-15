@@ -1,6 +1,11 @@
 // Proof Gatekeeper decision logic — the 7 documented trap varieties, checked
 // in circuit order. First failing check sets the reason code.
 // Source: https://agentgames.zkverify.io/events/proof-gatekeeper
+// Expiry is STRICT (current_block < expiry_block): the official
+// GatekeeperEvaluation circuit asserts it, and equality is EXPIRED —
+// verified by direct witness probing 2026-11-15 (the docs' loose phrasing
+// "current_block > expiry_block" is wrong at the boundary). The decision
+// MUST match the circuit evaluation exactly, or proof generation fails.
 
 export type ReasonCode =
   | "VALID_CONDITION"
@@ -62,7 +67,7 @@ export function decide(
     vkMatch: normAddr(input.proof_vk) === normAddr(input.registered_vk),
     thresholdOk: BigInt(input.public_balance) >= BigInt(input.minimum),
     notReused: !seenProofRefs.has(normAddr(input.proof_tx)),
-    notExpired: input.current_block <= input.expiry_block,
+    notExpired: input.current_block < input.expiry_block, // STRICT: equality is EXPIRED (official circuit)
     recipientOk: normAddr(input.recipient) === normAddr(input.condition_recipient),
     amountOk: BigInt(input.amount) <= BigInt(input.max_transfer),
   };

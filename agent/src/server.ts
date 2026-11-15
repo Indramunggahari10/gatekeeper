@@ -1,9 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { decide, validateInput, type GatekeeperInput } from "./decide.js";
 import { SIGNATURE_HEADER, describeSignature, signBody, signBodyWithKey, verifySignatureDetailed } from "./hmac.js";
-import { proveDecision, verifyProof } from "./prover.js";
+import { proveDecision } from "./prover.js";
 
-const BUILD = "preflight-shape-1";
+const BUILD = "official-circuit-1";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET;
@@ -111,17 +111,25 @@ async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<vo
     proof_tx: input.proof_tx,
   };
   if (result.reason_code !== "PROOF_REUSED") {
-    const { proof, publicSignals } = await proveDecision(result.checks, taskId);
-    const ok = await verifyProof(proof, publicSignals);
-    if (!ok) {
-      // Local verification failed: fail closed with no decision rather
-      // than emit a proof the platform would reject.
-      console.error(`task ${taskId}: local proof verification FAILED`);
-      sendJson(res, 500, { error: "proof verification failed" }, true);
-      return;
+    try {
+      const { proof, publicSignals } = await proveDecision(
+        input,
+        result.decision,
+        taskId,
+      );
+      response.proof = proof;
+      response.public_signals = publicSignals;
+    } catch (err) {
+      // Proving failed (e.g. witness assert on a decision/circuit
+      // divergence, or a malformed field): answer the decision WITHOUT a
+      // proof rather than failing the whole task. The decision still
+      // scores; only the proof bonus is at risk. Loud log: a proving
+      // failure on a well-formed task is a bug signal, never routine.
+      console.error(
+        `task ${taskId}: proving FAILED, answering decision-only:`,
+        err,
+      );
     }
-    response.proof = proof;
-    response.public_signals = publicSignals;
   }
 
   console.log(
