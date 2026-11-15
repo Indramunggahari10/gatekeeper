@@ -6,6 +6,9 @@ import { proveDecision, verifyProof } from "./prover.js";
 const PORT = Number(process.env.PORT ?? 3000);
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET;
 
+// DIAG (temporary): log ONLY presence/length/counts, never any value.
+console.error(`DIAG startup: secret_present=${SECRET !== undefined} secret_len=${SECRET ? SECRET.length : 0} env_keys=${Object.keys(process.env).length} railway_vars=${process.env.RAILWAY_SERVICE_NAME ? "present" : "absent"}`);
+
 if (!SECRET) {
   console.error("FATAL: AGENT_GAMES_HMAC_SECRET is not set. Refusing to start.");
   console.error("Use the platform-generated secret from Rotate Secret (dashboard).");
