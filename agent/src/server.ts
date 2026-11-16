@@ -1,9 +1,11 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { decide, validateInput, type GatekeeperInput } from "./decide.js";
+import { normProofRef } from "./fields.js";
 import { SIGNATURE_HEADER, describeSignature, signBody, signBodyWithKey, verifySignatureDetailed } from "./hmac.js";
 import { proveDecision } from "./prover.js";
+import { SeenRefStore } from "./seenRefs.js";
 
-const BUILD = "official-circuit-2";
+const BUILD = "official-circuit-2-hardening-1";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET;
@@ -17,10 +19,11 @@ if (!SECRET) {
   process.exit(1);
 }
 
-// Proof references seen so far (lowercased proof_tx). In-memory only:
-// restart clears it. For competition, persist this (the reuse trap spans
-// rounds). A restart that forgets a seen ref risks approving a replay.
-const seenProofRefs = new Set<string>();
+// Proof references seen so far. The store's in-memory Set is the hot
+// path; its append-only file is the durable record, loaded at boot, so a
+// restart cannot forget a replay (the reuse trap spans rounds).
+const seenStore = new SeenRefStore();
+console.error(`seen-refs: loaded ${seenStore.size} refs from ${seenStore.filePath}`);
 
 const MAX_BODY_BYTES = 1_000_000;
 
@@ -99,10 +102,14 @@ async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<vo
   const mode = String(envelope.mode ?? "unknown");
 
   // 3. Decide (fail closed: any check failure => REJECT with its reason).
-  const result = decide(input, seenProofRefs);
+  const result = decide(input, seenStore.refs);
   // Record the reference AFTER deciding, so this task is judged on the
-  // set as it was — a replayed ref is caught on the NEXT task.
-  seenProofRefs.add(input.proof_tx.trim().toLowerCase());
+  // set as it was — a replayed ref is caught on the NEXT task. The store
+  // dedupes: a replay is already recorded and is not appended again.
+  // (Validation guarantees proof_tx is a non-empty string; the null guard
+  // keeps this total regardless.)
+  const proofRef = normProofRef(input.proof_tx);
+  if (proofRef !== null) seenStore.record(proofRef);
 
   // 4. Prove (PROOF_REUSED tasks have no proof to submit — excluded).
   const response: Record<string, unknown> = {
