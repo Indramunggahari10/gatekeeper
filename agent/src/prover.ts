@@ -4,6 +4,11 @@ import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { GatekeeperInput } from "./decide.js";
+import {
+  FIELD_PRIME,
+  parseDecimalField,
+  parseHexField,
+} from "./fields.js";
 
 // snarkjs is CommonJS; load it via createRequire for ESM interop.
 const require = createRequire(import.meta.url);
@@ -19,9 +24,21 @@ const WASM_PATH = join(ROOT, "circuits", "gatekeeper.wasm");
 const ZKEY_PATH = join(ROOT, "circuits", "gatekeeper_final.zkey");
 const VK_PATH = join(ROOT, "circuits", "gk-vk.json");
 
-// BN128 scalar field prime.
-const FIELD_PRIME =
-  21888242871839275222246405745257275088548364400416034343698204186575808495617n;
+function fieldFromDecimal(v: string | number): bigint {
+  const b = parseDecimalField(v);
+  if (b === null || b >= FIELD_PRIME) {
+    throw new Error("decimal out of field range: " + v);
+  }
+  return b;
+}
+
+function fieldFromHex(h: string): bigint {
+  // Shared parser with decide(): optional 0x, any case, leading zeros,
+  // reduced mod p. What decide() compared is exactly what is proven.
+  const v = parseHexField(h);
+  if (v === null) throw new Error("not a hex string: " + h);
+  return v;
+}
 
 export interface ProofResult {
   proof: unknown;
@@ -56,20 +73,6 @@ export function taskIdToField(taskId: string): string {
   if (/^0x[0-9a-fA-F]+$/.test(s)) return (BigInt(s) % FIELD_PRIME).toString();
   const digest = createHash("sha256").update(s, "utf8").digest();
   return (BigInt("0x" + digest.toString("hex")) % FIELD_PRIME).toString();
-}
-
-function fieldFromDecimal(v: string | number): bigint {
-  const b = BigInt(v);
-  if (b < 0n || b >= FIELD_PRIME) {
-    throw new Error("decimal out of field range: " + v);
-  }
-  return b;
-}
-
-function fieldFromHex(h: string): bigint {
-  const s = h.trim().toLowerCase();
-  if (!/^0x[0-9a-f]+$/.test(s)) throw new Error("not a hex string: " + h);
-  return BigInt(s) % FIELD_PRIME;
 }
 
 function randomSalt(): string {

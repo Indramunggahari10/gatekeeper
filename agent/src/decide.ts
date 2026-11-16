@@ -6,6 +6,21 @@
 // verified by direct witness probing 2026-11-15 (the docs' loose phrasing
 // "current_block > expiry_block" is wrong at the boundary). The decision
 // MUST match the circuit evaluation exactly, or proof generation fails.
+//
+// Hex fields are compared as FIELD ELEMENTS via the shared parser in
+// fields.ts (same parser the prover uses): "0x00ab", "AB", and " 0xab "
+// are the same element. The old string comparison rejected padded or
+// prefix-less spellings the circuit accepts, and the old prover rejected
+// them outright — both failure modes cost proofs on well-formed tasks.
+// Unparseable fields fail CLOSED (check = false), never throw: decide()
+// never throws on validation-accepted input, and fails closed on any
+// field the shared parsers reject.
+
+import {
+  normProofRef,
+  parseDecimalField,
+  parseHexField,
+} from "./fields.js";
 
 export type ReasonCode =
   | "VALID_CONDITION"
@@ -55,21 +70,37 @@ export interface Decision {
   checks: Checks;
 }
 
-function normAddr(a: string): string {
-  return a.trim().toLowerCase();
-}
-
 export function decide(
   input: GatekeeperInput,
   seenProofRefs: ReadonlySet<string>,
 ): Decision {
+  // Parse each field ONCE through the shared parsers (same ones the
+  // prover uses). A null parse fails its check closed — never throws.
+  const registeredVk = parseHexField(input.registered_vk);
+  const proofVk = parseHexField(input.proof_vk);
+  const minimum = parseDecimalField(input.minimum);
+  const publicBalance = parseDecimalField(input.public_balance);
+  const recipient = parseHexField(input.recipient);
+  const conditionRecipient = parseHexField(input.condition_recipient);
+  const amount = parseDecimalField(input.amount);
+  const maxTransfer = parseDecimalField(input.max_transfer);
+  const proofRef = normProofRef(input.proof_tx);
+
   const checks: Checks = {
-    vkMatch: normAddr(input.proof_vk) === normAddr(input.registered_vk),
-    thresholdOk: BigInt(input.public_balance) >= BigInt(input.minimum),
-    notReused: !seenProofRefs.has(normAddr(input.proof_tx)),
+    vkMatch:
+      registeredVk !== null && proofVk !== null && registeredVk === proofVk,
+    thresholdOk:
+      minimum !== null &&
+      publicBalance !== null &&
+      publicBalance >= minimum,
+    notReused: proofRef !== null && !seenProofRefs.has(proofRef),
     notExpired: input.current_block < input.expiry_block, // STRICT: equality is EXPIRED (official circuit)
-    recipientOk: normAddr(input.recipient) === normAddr(input.condition_recipient),
-    amountOk: BigInt(input.amount) <= BigInt(input.max_transfer),
+    recipientOk:
+      recipient !== null &&
+      conditionRecipient !== null &&
+      recipient === conditionRecipient,
+    amountOk:
+      amount !== null && maxTransfer !== null && amount <= maxTransfer,
   };
 
   let reason_code: ReasonCode = "VALID_CONDITION";
@@ -101,7 +132,16 @@ const REQUIRED_FIELDS: (keyof GatekeeperInput)[] = [
   "proof_tx",
 ];
 
-/** Structural validation. Returns an error string, or null when usable. */
+/**
+ * Structural validation. Returns an error string, or null when usable.
+ * Uses the SAME parsers as decide()/proveDecision(), so every accepted
+ * input parses identically downstream — no 500s on accepted inputs.
+ * The four hex fields must be strings (a non-string used to pass this
+ * check and throw TypeError in the old normalizer, a 500 that lost the
+ * whole task). Whitespace-only strings and negative decimals are
+ * rejected: the prover cannot represent them, so accepting them only
+ * produced decision-only answers or crashes.
+ */
 export function validateInput(input: unknown): string | null {
   if (typeof input !== "object" || input === null) return "input must be an object";
   const obj = input as Record<string, unknown>;
@@ -110,15 +150,25 @@ export function validateInput(input: unknown): string | null {
       return `missing input field: ${f}`;
     }
   }
+  for (const f of ["registered_vk", "proof_vk", "recipient", "condition_recipient"]) {
+    if (parseHexField(obj[f]) === null) {
+      return `field ${f} is not a hex string`;
+    }
+  }
   for (const f of ["minimum", "public_balance", "amount", "max_transfer"]) {
-    try {
-      BigInt(String(obj[f]));
-    } catch {
-      return `field ${f} is not an integer string`;
+    if (parseDecimalField(obj[f]) === null) {
+      return `field ${f} is not a non-negative integer`;
     }
   }
   for (const f of ["expiry_block", "current_block"]) {
+    // Integer-only, as before this change: a negative block is
+    // nonsensical but was historically accepted (decision computed, proof
+    // impossible -> decision-only). Rejecting it would newly fail such
+    // tasks outright instead of scoring their decisions.
     if (!Number.isInteger(obj[f])) return `field ${f} is not an integer`;
+  }
+  if (normProofRef(obj["proof_tx"]) === null) {
+    return "field proof_tx is not a non-empty string";
   }
   return null;
 }
