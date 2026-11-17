@@ -222,7 +222,7 @@ server.listen(PORT, () => {
   selfCheckProver().then((ok) => {
     console.error(
       ok
-        ? "prover self-check: OK (canonical proof generated + verified)"
+        ? "prover self-check: OK (canonical proof generated)"
         : "prover self-check: FAILED — prover broken on this deploy, tasks will answer decision-only",
     );
   });
