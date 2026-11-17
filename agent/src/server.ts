@@ -2,10 +2,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { decide, validateInput, type GatekeeperInput } from "./decide.js";
 import { normProofRef } from "./fields.js";
 import { SIGNATURE_HEADER, describeSignature, signBody, signBodyWithKey, verifySignatureDetailed } from "./hmac.js";
-import { proveDecision } from "./prover.js";
+import { proveWithRetry, computeProveBudgetMs, selfCheckProver } from "./prover.js";
 import { SeenRefStore } from "./seenRefs.js";
 
-const BUILD = "official-circuit-2-hardening-1";
+const BUILD = "official-circuit-2-hardening-2";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const SECRET = process.env.AGENT_GAMES_HMAC_SECRET;
@@ -27,21 +27,46 @@ console.error(`seen-refs: loaded ${seenStore.size} refs from ${seenStore.filePat
 
 const MAX_BODY_BYTES = 1_000_000;
 
+// A body that never finishes arriving must not hold a handler (and its
+// 60s task window) hostage forever: the platform is the only client and
+// its bodies are ~600 bytes. Overridable for tests; the default leaves
+// ample room for a legitimately slow connection.
+const BODY_READ_TIMEOUT_MS = (() => {
+  const v = Number(process.env.BODY_READ_TIMEOUT_MS ?? 10_000);
+  return Number.isFinite(v) && v > 0 ? v : 10_000;
+})();
+
 function readRawBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      req.destroy();
+      reject(new Error("body read timeout"));
+    }, BODY_READ_TIMEOUT_MS);
+    timer.unref?.();
+    const done = (fn: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
     req.on("data", (chunk: Buffer) => {
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
-        reject(new Error("body too large"));
-        req.destroy();
+        done(() => {
+          req.destroy();
+          reject(new Error("body too large"));
+        });
         return;
       }
       chunks.push(chunk);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
+    req.on("end", () => done(() => resolve(Buffer.concat(chunks))));
+    req.on("error", (err) => done(() => reject(err)));
   });
 }
 
@@ -55,6 +80,7 @@ function sendJson(res: ServerResponse, status: number, obj: unknown, sign: boole
 }
 
 async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const receivedAt = Date.now();
   const rawBody = await readRawBody(req);
 
   // 1. Verify HMAC on the RAW body before parsing or processing anything.
@@ -112,29 +138,38 @@ async function handleTask(req: IncomingMessage, res: ServerResponse): Promise<vo
   if (proofRef !== null) seenStore.record(proofRef);
 
   // 4. Prove (PROOF_REUSED tasks have no proof to submit — excluded).
+  // Budgeted + one retry: a hung or transiently failing prover must not
+  // cost the whole task window. proveWithRetry returns null only when
+  // every attempt failed or the budget expired; the decision still goes
+  // out (decision-only), and each failed attempt is already logged loudly
+  // inside the wrapper. The budget honors the envelope deadline when it
+  // parses; a malformed deadline falls back to the default (logged: a
+  // systematic skew must not hide).
   const response: Record<string, unknown> = {
     decision: result.decision,
     reason_code: result.reason_code,
     proof_tx: input.proof_tx,
   };
   if (result.reason_code !== "PROOF_REUSED") {
-    try {
-      const { proof, publicSignals } = await proveDecision(
-        input,
-        result.decision,
-        taskId,
-      );
-      response.proof = proof;
-      response.public_signals = publicSignals;
-    } catch (err) {
-      // Proving failed (e.g. witness assert on a decision/circuit
-      // divergence, or a malformed field): answer the decision WITHOUT a
-      // proof rather than failing the whole task. The decision still
-      // scores; only the proof bonus is at risk. Loud log: a proving
-      // failure on a well-formed task is a bug signal, never routine.
+    const dl = envelope.deadline_at;
+    const deadlineParseable =
+      (typeof dl === "number" && Number.isFinite(dl)) ||
+      (typeof dl === "string" && !Number.isNaN(Date.parse(dl)));
+    if (dl !== undefined && !deadlineParseable) {
       console.error(
-        `task ${taskId}: proving FAILED, answering decision-only:`,
-        err,
+        `task ${taskId}: deadline_at unparseable (${JSON.stringify(envelope.deadline_at)}), using default prove budget`,
+      );
+    }
+    const budgetMs = computeProveBudgetMs(envelope.deadline_at, receivedAt);
+    const proved = await proveWithRetry(input, result.decision, taskId, {
+      budgetMs,
+    });
+    if (proved) {
+      response.proof = proved.proof;
+      response.public_signals = proved.publicSignals;
+    } else {
+      console.error(
+        `task ${taskId}: proving exhausted (budget ${budgetMs}ms), answering decision-only`,
       );
     }
   }
@@ -163,11 +198,32 @@ const server = createServer((req, res) => {
       sendJson(res, 404, { error: "not found" }, false);
     } catch (err) {
       console.error("unhandled error:", err);
-      if (!res.headersSent) sendJson(res, 500, { error: "internal error" }, true);
+      // The socket may already be gone (body-too-large / body-timeout
+      // destroy the request): never let the error reply itself throw —
+      // a throw here would reject the handler and crash the process.
+      try {
+        if (!res.headersSent && !res.destroyed) {
+          sendJson(res, 500, { error: "internal error" }, true);
+        }
+      } catch (sendErr) {
+        console.error("failed to send error reply:", sendErr);
+      }
     }
   })();
 });
 
 server.listen(PORT, () => {
   console.log(`agent-games gatekeeper listening on :${PORT}`);
+  // Boot self-check: prove the canonical input once in the background
+  // (never blocks serving, never throws). A failure here means this
+  // deploy's prover is broken — every provable task would fall back to
+  // decision-only. The log line is the deploy-time signal; check it
+  // after every deploy, before the next round opens.
+  selfCheckProver().then((ok) => {
+    console.error(
+      ok
+        ? "prover self-check: OK (canonical proof generated + verified)"
+        : "prover self-check: FAILED — prover broken on this deploy, tasks will answer decision-only",
+    );
+  });
 });

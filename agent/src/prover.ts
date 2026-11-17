@@ -127,3 +127,155 @@ export async function verifyProof(
   const vk = JSON.parse(readFileSync(VK_PATH, "utf8"));
   return snarkjs.groth16.verify(vk, publicSignals, proof);
 }
+
+// ---------------------------------------------------------------------------
+// Robustness wrappers (R5 push). These change WHEN and HOW OFTEN proving is
+// attempted, never WHAT is decided or proven: the decision, the circuit
+// inputs, and the proof path (proveDecision above) are untouched.
+// ---------------------------------------------------------------------------
+
+/** Default total wall-clock budget for proving one task (60s task window). */
+export const PROVE_BUDGET_DEFAULT_MS = 45_000;
+/** Safety margin kept between the prove budget and the envelope deadline. */
+export const PROVE_BUDGET_DEADLINE_MARGIN_MS = 5_000;
+/** Minimum prove budget: proving is fast (~0.4s warm), so a task is never
+ *  left unproven purely because its deadline looks close — a late answer
+ *  WITH a proof dominates an on-time answer without one (both are -2 if
+ *  the platform already timed out; only the proof can still score +12). */
+export const PROVE_BUDGET_FLOOR_MS = 8_000;
+/** Prove attempts per task: one retry recovers transient failures (file
+ *  read glitch, transient wasm error) at ~0.5s cost; deterministic
+ *  failures (witness assert) simply fail twice and cost nothing material. */
+export const PROVE_MAX_ATTEMPTS = 2;
+
+/**
+ * Total prove budget for one task, from the envelope's deadline_at and the
+ * moment the request arrived. Unparseable/missing deadline -> default.
+ * A deadline in the past (clock skew) clamps to the floor, never to zero:
+ * the task is always given a real prove attempt. Pure: unit-tested.
+ */
+export function computeProveBudgetMs(
+  deadlineAt: unknown,
+  receivedAtMs: number,
+): number {
+  // Epoch-ms numbers are used as-is (Date.parse rejects bare digit
+  // strings); ISO strings go through Date.parse; anything else -> default.
+  const parsed =
+    typeof deadlineAt === "number"
+      ? deadlineAt
+      : typeof deadlineAt === "string"
+        ? Date.parse(deadlineAt)
+        : NaN;
+  if (Number.isNaN(parsed)) return PROVE_BUDGET_DEFAULT_MS;
+  const remaining =
+    parsed - receivedAtMs - PROVE_BUDGET_DEADLINE_MARGIN_MS;
+  return Math.min(
+    PROVE_BUDGET_DEFAULT_MS,
+    Math.max(PROVE_BUDGET_FLOOR_MS, remaining),
+  );
+}
+
+export type ProveFn = (
+  input: GatekeeperInput,
+  decision: "APPROVE" | "REJECT",
+  taskId: string,
+) => Promise<ProofResult>;
+
+/**
+ * Prove with a wall-clock budget and one retry. Returns the proof, or null
+ * when every attempt failed or the budget expired — the caller answers
+ * decision-only. Each attempt gets a FRESH random salt (proveDecision
+ * generates it), so a retry is an independent proof, never a replay.
+ *
+ * Timeout safety: the attempt promise gets a no-op .catch attached the
+ * moment it is created. If the budget timer wins the race, the orphaned
+ * attempt keeps running in the background (snarkjs cannot be cancelled)
+ * and its eventual rejection is already handled — it can never surface
+ * as an unhandled rejection and crash the process. The timer is always
+ * cleared and unref'd on settle.
+ */
+export async function proveWithRetry(
+  input: GatekeeperInput,
+  decision: "APPROVE" | "REJECT",
+  taskId: string,
+  opts: {
+    budgetMs?: number;
+    maxAttempts?: number;
+    prove?: ProveFn;
+  } = {},
+): Promise<ProofResult | null> {
+  const budgetMs = opts.budgetMs ?? PROVE_BUDGET_DEFAULT_MS;
+  const maxAttempts = opts.maxAttempts ?? PROVE_MAX_ATTEMPTS;
+  const prove = opts.prove ?? proveDecision;
+  const deadline = Date.now() + budgetMs;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      console.error(
+        `task ${taskId}: prove budget exhausted before attempt ${attempt}`,
+      );
+      return null;
+    }
+    const attemptPromise = prove(input, decision, taskId);
+    // Handle the orphan's rejection NOW: if the timer wins below, this
+    // promise still settles later, and an unhandled rejection would crash
+    // the process (Node default). The .catch is a no-op for the race —
+    // Promise.race observes the original promise, not this branch.
+    attemptPromise.catch(() => {});
+    let timer: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), remaining);
+      timer.unref?.();
+    });
+    try {
+      const outcome = await Promise.race([attemptPromise, timeoutPromise]);
+      if (outcome !== "timeout") return outcome;
+      console.error(
+        `task ${taskId}: prove attempt ${attempt}/${maxAttempts} TIMED OUT after ${remaining}ms budget`,
+      );
+    } catch (err) {
+      console.error(
+        `task ${taskId}: prove attempt ${attempt}/${maxAttempts} FAILED:`,
+        err,
+      );
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+  return null;
+}
+
+/** Canonical well-formed input for the boot self-check: every check
+ *  passes, decision APPROVE, so any failure signals a broken prover
+ *  (missing/corrupt circuit artifacts), never a decision mismatch. */
+const SELF_CHECK_INPUT: GatekeeperInput = {
+  registered_vk: "0x7d3a1111111111111111111111111111111111f291",
+  proof_vk: "0x7d3a1111111111111111111111111111111111f291",
+  minimum: "1000",
+  public_balance: "1460",
+  expiry_block: 19842201,
+  current_block: 19832000,
+  recipient: "0xDe42000000000000000000000000000000009f01",
+  condition_recipient: "0xDe42000000000000000000000000000000009f01",
+  amount: "500",
+  max_transfer: "1000",
+  proof_tx: "0xboot-self-check",
+};
+
+/**
+ * Boot self-check: prove the canonical input once and verify locally.
+ * Never throws and never touches the seen-ref store. A false result
+ * means the prover is broken on this deploy (e.g. corrupt artifacts) —
+ * the server still starts and answers decisions, but every provable
+ * task will fall back to decision-only until the deploy is fixed.
+ */
+export async function selfCheckProver(): Promise<boolean> {
+  try {
+    await proveDecision(SELF_CHECK_INPUT, "APPROVE", "boot-self-check");
+    return true;
+  } catch (err) {
+    console.error("prover self-check FAILED:", err);
+    return false;
+  }
+}

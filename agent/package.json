@@ -18,7 +18,8 @@
     "build": "tsc",
     "setup-circuit": "bash scripts/setup-circuit.sh",
     "start": "tsx src/server.ts",
-    "test": "node test/run-test.mjs"
+    "test": "node test/run-test.mjs",
+    "test:robustness": "npx tsx test/robustness.mts"
   },
   "type": "module",
   "version": "1.0.0",

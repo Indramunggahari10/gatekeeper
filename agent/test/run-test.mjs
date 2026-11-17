@@ -3,8 +3,9 @@
 // Run: npm test   (requires circuit artifacts in build/ — see README)
 import { spawn } from "node:child_process";
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { createRequire } from "node:module";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -99,9 +100,12 @@ async function waitForHealth(timeoutMs = 60000) {
 async function main() {
   const vk = JSON.parse(readFileSync(join(ROOT, "build", "verification_key.json"), "utf8"));
 
+  // Isolate the seen-ref log: without this the suite writes its test refs
+  // into the real log, and a second run fails test 1 as PROOF_REUSED.
+  const seenRefsPath = join(tmpdir(), `seen-refs-test-${process.pid}.log`);
   const server = spawn("npx", ["tsx", "src/server.ts"], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(PORT), AGENT_GAMES_HMAC_SECRET: SECRET },
+    env: { ...process.env, PORT: String(PORT), AGENT_GAMES_HMAC_SECRET: SECRET, SEEN_REFS_PATH: seenRefsPath },
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
   });
@@ -183,6 +187,7 @@ async function main() {
     } catch {
       server.kill("SIGTERM");
     }
+    try { rmSync(seenRefsPath, { force: true }); } catch { /* best effort */ }
   }
 
   if (failures > 0) {
