@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import type { GatekeeperInput } from "./decide.js";
 import {
@@ -207,17 +208,34 @@ export async function proveWithRetry(
   const budgetMs = opts.budgetMs ?? PROVE_BUDGET_DEFAULT_MS;
   const maxAttempts = opts.maxAttempts ?? PROVE_MAX_ATTEMPTS;
   const prove = opts.prove ?? proveDecision;
-  const deadline = Date.now() + budgetMs;
+  // Monotonic elapsed for the budget: a wall-clock adjustment mid-request
+  // (NTP step) must not extend or shrink the remaining allowance. The
+  // wall clock is used only once, by computeProveBudgetMs, to turn the
+  // envelope deadline into this total budget.
+  const startMono = performance.now();
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const remaining = deadline - Date.now();
+    const remaining = Math.ceil(budgetMs - (performance.now() - startMono));
     if (remaining <= 0) {
       console.error(
         `task ${taskId}: prove budget exhausted before attempt ${attempt}`,
       );
       return null;
     }
-    const attemptPromise = prove(input, decision, taskId);
+    let attemptPromise: Promise<ProofResult>;
+    try {
+      attemptPromise = prove(input, decision, taskId);
+    } catch (err) {
+      // A synchronous throw while invoking the prover must fail the
+      // attempt, never escape: proveDecision is async (throws become
+      // rejections), but a throw here would otherwise bypass the retry
+      // loop and lose the whole task to the server's 500 path.
+      console.error(
+        `task ${taskId}: prove attempt ${attempt}/${maxAttempts} threw synchronously:`,
+        err,
+      );
+      continue;
+    }
     // Handle the orphan's rejection NOW: if the timer wins below, this
     // promise still settles later, and an unhandled rejection would crash
     // the process (Node default). The .catch is a no-op for the race —

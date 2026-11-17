@@ -85,6 +85,23 @@ async function testRetry(): Promise<void> {
   check("retry: always-fail returns null", r2 === null);
   check("retry: always-fail used exactly 2 attempts", calls === 2);
 
+  // Synchronous throw while invoking the prover: must fail the attempt,
+  // never escape proveWithRetry (which would 500 the whole task).
+  calls = 0;
+  const syncThrow = (): Promise<ProofResult> => {
+    calls++;
+    throw new Error("sync boom");
+  };
+  let threw = false;
+  let r2b: ProofResult | null = FAKE_PROOF;
+  try {
+    r2b = await proveWithRetry(INPUT, "APPROVE", "t-syncthrow", { budgetMs: 5000, prove: syncThrow });
+  } catch {
+    threw = true;
+  }
+  check("retry: sync-throwing prover returns null without escaping", !threw && r2b === null);
+  check("retry: sync-throwing prover used exactly 2 attempts", calls === 2);
+
   // Slow success inside budget.
   const slowOk = async (): Promise<ProofResult> => {
     await sleep(300);
